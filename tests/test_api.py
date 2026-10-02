@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from app.adjudication import StationStateChange, replay_zone
 from app.config import Settings
 from app.main import create_app
 
@@ -765,3 +766,493 @@ def test_concurrent_publish_and_upload_consistent(client, station, device):
     assert len({p["publication_id"] for p in pubs}) == 5
     rows = client.get("/stations/1/readings").json()
     assert len(rows) == 13  # 3 条预警读数 + 10 条并发补传，一条不丢
+
+
+# ---------------------------------------------------------------- 防汛责任区（跨站联动）
+
+def make_station_with_device(client, name, device_no, rise=10.0, clear=8.0):
+    sid = client.post(
+        "/stations", json={"name": name, "rise_threshold": rise, "clear_threshold": clear}
+    ).json()["id"]
+    client.post(f"/stations/{sid}/devices", json={"device_no": device_no})
+    return sid, device_no
+
+
+def create_zone(client, station_ids, minutes, k, name="青石峡片区"):
+    return client.post(
+        "/zones",
+        json={
+            "name": name,
+            "effective_at": iso(BASE + timedelta(minutes=minutes)),
+            "station_ids": station_ids,
+            "trigger_count": k,
+        },
+    )
+
+
+def zone_timeline(client, zone_id):
+    r = client.get(f"/zones/{zone_id}/timeline")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_create_zone_persists_config(client):
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    s2, _ = make_station_with_device(client, "乙站", "D2")
+    r = create_zone(client, [s1, s2], 60, 2)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["trigger_count"] == 2
+    assert body["station_ids"] == [s1, s2]
+    assert [m["position"] for m in body["members"]] == [0, 1]
+    assert body["effective_at"] == iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z")
+    assert body["pending_zone"]["status"] == "normal"
+
+    detail = client.get(f"/zones/{body['id']}").json()
+    assert detail["name"] == "青石峡片区"
+    assert [m["station_id"] for m in detail["members"]] == [s1, s2]
+    listed = client.get("/zones").json()
+    assert [z["id"] for z in listed] == [body["id"]]
+
+
+def test_zone_unknown_station_rejected(client, station):
+    r = create_zone(client, [station, 999], 0, 1)
+    assert r.status_code == 404
+    assert r.json()["detail"]["unknown_station_ids"] == [999]
+
+
+def test_zone_duplicate_members_rejected(client, station):
+    r = create_zone(client, [station, station], 0, 1)
+    assert r.status_code == 400
+
+
+def test_zone_naive_effective_at_rejected(client, station):
+    r = client.post(
+        "/zones",
+        json={
+            "name": "z",
+            "effective_at": "2026-10-01T08:00:00",
+            "station_ids": [station],
+            "trigger_count": 1,
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_zone_empty_name_rejected(client, station):
+    r = client.post(
+        "/zones",
+        json={
+            "name": "   ",
+            "effective_at": iso(BASE),
+            "station_ids": [station],
+            "trigger_count": 1,
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_zone_k_out_of_bounds_rejected(client, station):
+    # K > 成员数
+    r = create_zone(client, [station], 0, 2)
+    assert r.status_code == 400
+    # K < 1
+    r = client.post(
+        "/zones",
+        json={
+            "name": "z",
+            "effective_at": iso(BASE),
+            "station_ids": [station],
+            "trigger_count": 0,
+        },
+    )
+    assert r.status_code == 400
+    # 空成员列表
+    r = client.post(
+        "/zones",
+        json={"name": "z", "effective_at": iso(BASE), "station_ids": [], "trigger_count": 1},
+    )
+    assert r.status_code == 400
+    assert client.get("/zones").json() == []  # 全部拒绝，未落库
+
+
+def test_zone_config_immutable_after_registration(client):
+    # 责任区没有修改 / 删除接口；重复登记同名责任区允许（名称不做唯一约束），但配置各自独立
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    r1 = create_zone(client, [s1], 60, 1, name="同名片区")
+    assert r1.status_code == 201
+    r2 = create_zone(client, [s1], 120, 1, name="同名片区")
+    assert r2.status_code == 201
+    ids = [z["id"] for z in client.get("/zones").json()]
+    assert ids == [r1.json()["id"], r2.json()["id"]]
+    # 首个责任区生效时间不随第二次登记改变
+    assert client.get(f"/zones/{r1.json()['id']}").json()["effective_at"] == \
+        iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z")
+
+
+def test_zone_warning_when_k_stations_warn(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    # 甲站 60/65/70 预警；乙站 70 一条不预警 → 区域不预警
+    for m in (60, 65, 70):
+        upload(client, d1, m, m, 12.0)
+    upload(client, d2, 1, 70, 12.0)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    # 乙站 70/75/85 也预警（首尾 15 分钟 ≥10）→ 85 时刻两站均预警，区域在 85 预警
+    upload(client, d2, 2, 75, 12.0)
+    upload(client, d2, 3, 85, 12.0)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "warning"
+    assert len(tl["events"]) == 1
+    ev = tl["events"][0]
+    assert ev["type"] == "warning"
+    assert ev["at"] == iso(BASE + timedelta(minutes=85)).replace("+00:00", "Z")
+    assert ev["warning_station_ids"] == sorted([s1, s2])
+    assert ev["warning_station_count"] == 2
+
+
+def test_zone_same_timestamp_merged(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    # 甲站 00/05/10 预警，乙站 00/05/10 预警
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    tl = zone_timeline(client, 1)
+    # 10 分钟时刻两站同时变预警 → 该刻合并后计数=2 → 恰好一个区域事件
+    assert [(e["type"], e["at"], e["warning_station_count"]) for e in tl["events"]] == [
+        ("warning", iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"), 2)
+    ]
+
+
+def test_zone_clear_when_below_k(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    # 甲站解除（15/21 低水位）→ 预警站数 1 < K=2 → 区域在 21 解除
+    upload(client, d1, 4, 15, 7.0)
+    upload(client, d1, 5, 21, 7.0)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "normal"
+    assert [e["type"] for e in tl["events"]] == ["warning", "cleared"]
+    ev = tl["events"][-1]
+    assert ev["at"] == iso(BASE + timedelta(minutes=21)).replace("+00:00", "Z")
+    assert ev["warning_station_ids"] == [s2]
+    assert ev["warning_station_count"] == 1
+    # 甲站再次预警（30/35/45）→ 区域重新预警
+    upload(client, d1, 6, 30, 12.0)
+    upload(client, d1, 7, 35, 12.0)
+    upload(client, d1, 8, 45, 12.0)
+    tl = zone_timeline(client, 1)
+    assert [e["type"] for e in tl["events"]] == ["warning", "cleared", "warning"]
+    assert tl["events"][-1]["at"] == iso(BASE + timedelta(minutes=45)).replace("+00:00", "Z")
+
+
+def test_zone_one_event_max_per_timestamp(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    # 同一时刻（20）：甲站解除，乙站再触发一次预警周期不可能（乙站已预警），
+    # 这里改为验证同刻一站解除、另一站仍预警时不会抖动出两个区域事件
+    upload(client, d2, 4, 15, 7.0)
+    upload(client, d2, 5, 20, 7.0)   # 乙站 20 解除 → 区域 20 解除
+    tl = zone_timeline(client, 1)
+    assert [e["type"] for e in tl["events"]].count("cleared") == 1
+    assert tl["events"][-1]["at"] == iso(BASE + timedelta(minutes=20)).replace("+00:00", "Z")
+
+
+def test_zone_k1_warns_with_single_station(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 1)
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "warning"
+    assert tl["events"][0]["warning_station_ids"] == [s1]
+    # 乙站同期正常：members 反映各站当前状态
+    statuses = {m["station_id"]: m["warning"] for m in tl["members"]}
+    assert statuses == {s1: True, s2: False}
+
+
+def test_zone_initial_warning_before_effective_at(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    # 两站在生效前（00/05/10）均已预警
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    create_zone(client, [s1, s2], 60, 2)  # 生效时刻 60
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "warning"
+    # 此前仍在预警的站计入初始状态，初始满足 K → 在生效时刻预警
+    assert [(e["type"], e["at"]) for e in tl["events"]] == [
+        ("warning", iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"))
+    ]
+    pre = {m["station_id"]: m["warning_before_effective"] for m in tl["members"]}
+    assert pre == {s1: True, s2: True}
+
+
+def test_zone_initial_not_satisfied_then_triggers(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)   # 仅甲站在生效前预警
+    create_zone(client, [s1, s2], 60, 2)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    # 生效后乙站在 70/75/85 预警 → 85 两站齐预警，区域预警
+    upload(client, d2, 1, 70, 12.0)
+    upload(client, d2, 2, 75, 12.0)
+    upload(client, d2, 3, 85, 12.0)
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "warning"
+    assert tl["events"][0]["at"] == iso(BASE + timedelta(minutes=85)).replace("+00:00", "Z")
+
+
+def test_zone_change_at_exact_effective_at_merged_with_initial(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    # 甲站在生效前已预警；乙站恰好在生效时刻 60 完成预警（50/55/60）
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)
+    create_zone(client, [s1, s2], 60, 2)
+    upload(client, d2, 1, 50, 12.0)
+    upload(client, d2, 2, 55, 12.0)
+    upload(client, d2, 3, 60, 12.0)
+    tl = zone_timeline(client, 1)
+    # 初始甲站预警 + 生效同刻乙站变预警，先合并再计数 → 生效时刻一个预警事件
+    assert [(e["type"], e["at"], e["warning_station_count"]) for e in tl["events"]] == [
+        ("warning", iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"), 2)
+    ]
+
+
+def test_zone_events_before_effective_at_ignored(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    # 甲站 00/05/10 预警后于 15/21 解除；乙站 00/05/10 预警后未解除
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    upload(client, d1, 4, 15, 7.0)
+    upload(client, d1, 5, 21, 7.0)
+    create_zone(client, [s1, s2], 60, 2)
+    tl = zone_timeline(client, 1)
+    # 生效时甲站已不预警（此前最后事件是解除），仅乙站预警 → 区域不预警，历史事件不重放
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    assert {m["station_id"]: m["warning_before_effective"] for m in tl["members"]} == {
+        s1: False,
+        s2: True,
+    }
+
+
+def test_zone_recomputes_after_backfill_and_void(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)   # 甲站预警（读数 id 1..3）
+    assert zone_timeline(client, 1)["status"] == "normal"
+    # 乙站补传达成预警（读数 id 4..6）→ 区域联动结果重算
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d2, i, m, 12.0)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    # 审核作废乙站最后一条关键读数（id 6）→ 乙站预警不成立，区域回到正常
+    client.post("/readings/6/void", json={"reason": "误报"})
+    assert zone_timeline(client, 1)["status"] == "normal"
+
+
+def test_zone_recomputes_after_correction(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    # 更正甲站首条读数为低水位 → 甲站连续被打断、其历史预警事件在重算后消失
+    # → 区域待发布时间线整体重算：区域不再达到 K，事件为空（与单站重算语义一致）
+    client.post("/readings/1/correct", json={"water_level": 5.0, "reason": "抄录错误"})
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    statuses = {m["station_id"]: m["warning"] for m in tl["members"]}
+    assert statuses == {s1: False, s2: True}
+
+
+def test_zone_recomputes_after_threshold_version(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    # 阈值提严（上升 100）使乙站历史读数不再达预警 → 区域重算后不再达到 K
+    client.post(
+        f"/stations/{s2}/threshold-versions",
+        json={
+            "effective_at": iso(BASE),
+            "rise_threshold": 100.0,
+            "clear_threshold": 90.0,
+            "reason": "演练阈值",
+        },
+    )
+    tl = zone_timeline(client, 1)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+    statuses = {m["station_id"]: m["warning"] for m in tl["members"]}
+    assert statuses == {s1: True, s2: False}
+
+
+def test_zone_publish_freezes_with_station_timelines(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate((0, 5, 10), start=1):
+            upload(client, d, i, m, 12.0)
+    r = client.post("/publish", json={"note": "区域首次发布"})
+    assert r.status_code == 201
+    assert r.json()["zones"][0]["status"] == "warning"
+    pub_id = r.json()["publication_id"]
+
+    pub = client.get(f"/publications/{pub_id}").json()
+    assert pub["zone_timelines"][0]["status"] == "warning"
+    assert pub["zone_timelines"][0]["events"][0]["warning_station_count"] == 2
+    cur = client.get("/public/current").json()
+    assert cur["zone_timelines"][0]["zone_id"] == 1
+
+    zpub = client.get("/public/zones/1/timeline").json()
+    assert zpub["published"] is True
+    assert zpub["status"] == "warning"
+
+    # 发布后两站解除：待发布区域正常，公开快照仍预警
+    for d in (d1, d2):
+        upload(client, d, 4, 15, 7.0)
+        upload(client, d, 5, 21, 7.0)
+    assert zone_timeline(client, 1)["status"] == "normal"
+    assert client.get("/public/zones/1/timeline").json()["status"] == "warning"
+    assert client.get("/public/current").json()["zone_timelines"][0]["status"] == "warning"
+
+    # 重新发布后公开结果更新，历史发布快照不变
+    client.post("/publish", json={"note": "区域解除发布"})
+    assert client.get("/public/zones/1/timeline").json()["status"] == "normal"
+    old = client.get(f"/publications/{pub_id}").json()
+    assert old["zone_timelines"][0]["status"] == "warning"
+
+
+def test_zone_created_after_publication_missing_from_old_snapshot(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    for i, m in enumerate((0, 5, 10), start=1):
+        upload(client, d1, i, m, 12.0)
+    r1 = client.post("/publish", json={"note": "区域建立前"})
+    assert r1.json()["zones"] == []
+    create_zone(client, [s1], 0, 1)
+    # 旧发布不含该责任区
+    old = client.get(f"/publications/{r1.json()['publication_id']}").json()
+    assert old["zone_timelines"] == []
+    # 尚无该责任区发布 → 明确报无结果（404）
+    assert client.get("/public/zones/1/timeline").status_code == 404
+    client.post("/publish", json={"note": "区域建立后"})
+    assert client.get("/public/zones/1/timeline").status_code == 200
+
+
+def test_public_zone_404_when_zone_unknown_or_unpublished(client):
+    assert client.get("/public/zones/999/timeline").status_code == 404
+    s1, _ = make_station_with_device(client, "甲站", "D1")
+    r = create_zone(client, [s1], 0, 1)
+    zid = r.json()["id"]
+    # 从未发布过任何结果
+    assert client.get("/public/zones/{zid}/timeline".format(zid=zid)).status_code == 404
+    assert client.get(f"/zones/{zid}/timeline").status_code == 200  # 待发布仍可查
+    assert client.get("/zones/999/timeline").status_code == 404
+
+
+# ---------------------------------------------------------------- replay_zone 纯函数边界
+
+def t(minutes):
+    return BASE + timedelta(minutes=minutes)
+
+
+def test_replay_initial_meets_k_warns_at_effective():
+    res = replay_zone([], [1, 2], trigger_count=2, effective_at=t(60))
+    assert res.status == "warning"
+    assert [(e.type, e.at) for e in res.events] == [("warning", t(60))]
+    assert res.events[0].warning_station_ids == (1, 2)
+
+
+def test_replay_initial_below_k_no_event():
+    res = replay_zone([], [1], trigger_count=2, effective_at=t(0))
+    assert res.status == "normal"
+    assert res.events == []
+    # 生效时刻的空 tick 不应留下解除事件
+    assert res.active_warning_since is None
+
+
+def test_replay_same_tick_merged_no_flap():
+    # 初始站 1、2 预警（K=2）→ 生效即预警；
+    # t=10 同一刻：站 1 解除、站 3 预警 → 合并后仍是 2 个预警 → 不解除
+    changes = [
+        StationStateChange(1, t(10), "normal", order=5),
+        StationStateChange(3, t(10), "warning", order=9),
+    ]
+    res = replay_zone(changes, [1, 2], trigger_count=2, effective_at=t(0))
+    assert res.status == "warning"
+    assert [e.type for e in res.events] == ["warning"]
+    assert res.events[0].at == t(0)
+    assert res.events[0].warning_station_ids == (1, 2)
+
+
+def test_replay_warn_and_clear_flow():
+    changes = [
+        StationStateChange(1, t(5), "warning"),
+        StationStateChange(2, t(10), "warning"),   # 达到 K=2 → 预警
+        StationStateChange(1, t(20), "normal"),    # 降到 1 → 解除
+    ]
+    res = replay_zone(changes, [], trigger_count=2, effective_at=t(0))
+    assert [e.type for e in res.events] == ["warning", "cleared"]
+    assert res.events[0].at == t(10)
+    assert res.events[0].warning_station_ids == (1, 2)
+    assert res.events[1].at == t(20)
+    assert res.events[1].warning_station_ids == (2,)
+    assert res.status == "normal"
+
+
+def test_replay_changes_before_effective_ignored():
+    # 生效前的预警与解除变化都不重放；初始预警集合由调用方另行给出
+    changes = [
+        StationStateChange(1, t(-10), "warning"),
+        StationStateChange(1, t(-5), "normal"),
+        StationStateChange(2, t(20), "warning"),
+    ]
+    res = replay_zone(changes, [], trigger_count=2, effective_at=t(0))
+    # 生效时 0 个；t=20 仍只有站 2 → 永不达到 K=2
+    assert res.status == "normal"
+    assert res.events == []
+
+
+def test_replay_one_event_max_per_tick_even_if_count_crosses_twice_logically():
+    # 同刻多变化按合并后结果一次性判定，绝不按站逐个产生抖动事件
+    changes = [
+        StationStateChange(1, t(10), "warning"),
+        StationStateChange(2, t(10), "warning"),
+        StationStateChange(3, t(10), "normal"),   # 站 3 初始预警、同刻解除
+    ]
+    res = replay_zone(changes, [3, 4], trigger_count=3, effective_at=t(0))
+    # 初始 3、4 预警（<3? 等于2 < 3）→ 正常；t=10 合并后 {1,2,4} = 3 → 一个预警
+    assert [e.type for e in res.events] == ["warning"]
+    assert res.events[0].warning_station_ids == (1, 2, 4)

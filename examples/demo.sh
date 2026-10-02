@@ -110,5 +110,92 @@ curl -s -o /dev/null -w '监测站不存在 → HTTP %{http_code}\n' \
 step "18. 发布冻结：调整阈值只改变待发布时间线，历史快照重新发布后才更新"
 curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"阈值版本演示发布"}' > /dev/null
 echo "最新公开状态: $(curl -s "$BASE/public/current" | python3 -c 'import sys,json;print(json.load(sys.stdin)["timelines"][1]["status"])')"
+
+# ---------------------------------------------------------------
+# 防汛责任区（跨站联动）：在新站 3、4 上完整演示
+# ---------------------------------------------------------------
+
+step "19. 登记两个成员站与设备（青石峡片区）"
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"西坡站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"东沟站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations/3/devices" -H "$J" -d '{"device_no":"DEV-003"}' > /dev/null
+curl -s -X POST "$BASE/stations/4/devices" -H "$J" -d '{"device_no":"DEV-004"}' > /dev/null
+
+step "20. 两站同时刻各补传 3 条达阈值读数（2026-10-01 10:00/10:05/10:10）"
+for D in DEV-003 DEV-004; do
+  for m in 00 05 10; do
+    curl -s -X POST "$BASE/readings" -H "$J" \
+      -d "{\"device_no\":\"$D\",\"seq\":30$m,\"observed_at\":\"2026-10-01T10:$m:00+08:00\",\"water_level\":12.0}" > /dev/null
+  done
+done
+
+step "21. 登记责任区（非空名称 + 带时区生效时间 10:00 + 成员 [3,4] + K=2）"
+curl -s -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"青石峡片区","effective_at":"2026-10-01T10:00:00+08:00","station_ids":[3,4],"trigger_count":2}'
+echo
+
+step "22. 待发布区域联动：同刻合并后两站齐预警 → 10:10 区域预警（每刻最多一个事件）"
+curl -s "$BASE/zones/1/timeline" | python3 -c '
+import sys, json
+z = json.load(sys.stdin)
+print("区域状态:", z["status"], "| 当前预警站:", z["warning_station_ids"])
+for e in z["events"]:
+    print("  事件:", e["type"], e["at"], "发生时预警站:", e["warning_station_ids"])
+'
+
+step "23. 责任区登记校验：未知站 404、重复成员/无时区/K 越界 400"
+curl -s -o /dev/null -w '未知监测站 ID      → HTTP %{http_code}\n' -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"x","effective_at":"2026-10-01T10:00:00+08:00","station_ids":[3,999],"trigger_count":2}'
+curl -s -o /dev/null -w '重复成员           → HTTP %{http_code}\n' -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"x","effective_at":"2026-10-01T10:00:00+08:00","station_ids":[3,3],"trigger_count":1}'
+curl -s -o /dev/null -w '生效时间不带时区   → HTTP %{http_code}\n' -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"x","effective_at":"2026-10-01T10:00:00","station_ids":[3],"trigger_count":1}'
+curl -s -o /dev/null -w 'K=2 但成员仅 1 个  → HTTP %{http_code}\n' -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"x","effective_at":"2026-10-01T10:00:00+08:00","station_ids":[3],"trigger_count":2}'
+curl -s -o /dev/null -w '空白名称           → HTTP %{http_code}\n' -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"   ","effective_at":"2026-10-01T10:00:00+08:00","station_ids":[3],"trigger_count":1}'
+
+step "24. 审核作废一站关键读数 → 待发布区域立即重算为正常"
+VOID_ID="$(curl -s "$BASE/stations/4/readings" | python3 -c 'import sys,json;print(json.load(sys.stdin)[-1]["id"])')"
+curl -s -X POST "$BASE/readings/$VOID_ID/void" -H "$J" -d '{"reason":"误报剔除"}' > /dev/null
+echo "待发布区域状态: $(curl -s "$BASE/zones/1/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')"
+
+step "25. 尚无该责任区发布 → 公开查询明确报无结果（404）"
+curl -s -w ' [HTTP %{http_code}]\n' "$BASE/public/zones/1/timeline"
+
+step "26. 发布：与各站时间线一同冻结（响应含 zones 摘要）"
+curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"责任区演示发布"}' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("发布号:",d["publication_id"],"| zones:",d["zones"])'
+
+step "27. 生效前已预警计入初始状态：新站 5 在 10:00 前预警，责任区 11:00 生效即预警"
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"北坳站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations/5/devices" -H "$J" -d '{"device_no":"DEV-005"}' > /dev/null
+for m in 00 05 10; do
+  curl -s -X POST "$BASE/readings" -H "$J" \
+    -d "{\"device_no\":\"DEV-005\",\"seq\":50$m,\"observed_at\":\"2026-10-01T10:$m:00+08:00\",\"water_level\":12.0}" > /dev/null
+done
+curl -s -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"北坳片区","effective_at":"2026-10-01T11:00:00+08:00","station_ids":[5],"trigger_count":1}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+p = d["pending_zone"]
+print("初始满足 K → 区域状态:", p["status"], "| 事件:", [(e["type"], e["at"]) for e in p["events"]])
+'
+
+step "28. 重新发布后公开结果含两个责任区；历史快照保持不变"
+curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"含北坳片区"}' > /dev/null
+curl -s "$BASE/public/current" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("最新发布号:", d["publication_id"])
+for z in d["zone_timelines"]:
+    print("  责任区", z["zone_id"], z["zone_name"], "状态:", z["status"],
+          "事件:", [(e["type"], e["at"], e["warning_station_ids"]) for e in z["events"]])
+'
+echo "历史发布 1 的区域数: $(curl -s "$BASE/publications/1" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["zone_timelines"]))')"
 echo
 echo "演示完成。交互式文档：$BASE/docs"

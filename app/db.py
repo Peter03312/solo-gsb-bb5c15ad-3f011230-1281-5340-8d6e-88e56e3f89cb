@@ -83,6 +83,28 @@ CREATE TABLE IF NOT EXISTS publication_timelines (
     timeline_json  TEXT NOT NULL,
     PRIMARY KEY (publication_id, station_id)
 );
+
+CREATE TABLE IF NOT EXISTS zones (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,                -- 责任区名称（非空，允许同名）
+    effective_at  TEXT NOT NULL,                -- 生效时间（UTC ISO8601，登记时必带时区）
+    trigger_count INTEGER NOT NULL,             -- 触发站数 K：1 <= K <= 成员数
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS zone_members (
+    zone_id    INTEGER NOT NULL REFERENCES zones(id),
+    station_id INTEGER NOT NULL REFERENCES stations(id),
+    position   INTEGER NOT NULL,                -- 登记时的列表顺序（0 起）
+    PRIMARY KEY (zone_id, station_id)
+);
+
+CREATE TABLE IF NOT EXISTS publication_zones (
+    publication_id INTEGER NOT NULL REFERENCES publications(id),
+    zone_id        INTEGER NOT NULL REFERENCES zones(id),
+    timeline_json  TEXT NOT NULL,               -- 发布时冻结的区域联动时间线
+    PRIMARY KEY (publication_id, zone_id)
+);
 """
 
 

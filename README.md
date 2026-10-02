@@ -1,6 +1,6 @@
 # 山洪水位预警裁定服务
 
-基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整）、按规则自动裁定预警与解除、审核修订并重算、发布冻结公开结果。
+基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整）、按规则自动裁定预警与解除、审核修订并重算、**防汛责任区跨站联动预警**、发布冻结公开结果。
 
 ## 一键启动
 
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-启动时自动完成 SQLite 建表初始化（含阈值版本表），无需额外迁移步骤；已有数据库重启后会自动补齐新表。
+启动时自动完成 SQLite 建表初始化（含阈值版本表、责任区表），无需额外迁移步骤；已有数据库重启后会自动补齐新表。
 
 ## 地址与端口
 
@@ -76,11 +76,66 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 版本按 `effective_at <= 观测时间` 取最晚一版（边界包含，同刻用新版）；未命中时回退登记阈值；
 - 时间线响应新增每读数采用的阈值信息：`readings[].{reading_id, observed_at, water_level, rise_threshold, clear_threshold, threshold_version_id}`（`threshold_version_id` 为 `null` 表示基准值）；`events[]` 也附带触发当时的 `rise_threshold / clear_threshold / threshold_version_id`。原有顶层字段与其他接口的请求响应保持不变。
 
-## API 一览
+## 防汛责任区（跨站联动预警）
 
-### 监测站与设备
+防汛人员按责任区查看多个监测站的**跨站联动**结果。登记责任区时提供：
+
+- `name`：**非空**名称（纯空白拒绝；同名责任区允许并存）；
+- `effective_at`：**必带时区**的生效时间；
+- `station_ids`：成员监测站 ID 列表，**互不重复**且至少 1 个，均须为已登记站；
+- `trigger_count`：触发站数 K，**1 ≤ K ≤ 成员站数量**。
+
+校验：未知站 → **404**（响应给出 `unknown_station_ids`）；重复成员 / 无时区 / 空白名称 / 空成员 / K 越界 → **400**。**登记后配置保持不变**（不提供修改、删除接口）。
+
+联动裁定规则：
+
+1. **自生效时刻起**，按**观测时间**重放成员站待发布时间线中的预警 / 解除事件；生效时刻之前的区域不产生事件；
+2. **此前仍在预警的站计入初始状态**：成员站在生效时刻之前最后一个事件是预警（其后无解除）即视为生效时仍预警；**初始即满足 K** 时，在**生效时刻**发出区域预警；
+3. **同一时刻先合并所有站的状态变化**，再对预警站数计数：达到 K 发出区域预警、降到 K 以下解除；**每个时刻最多一个区域事件**（同刻一站解除、另一站预警时按合并结果一次性判定，不抖动）；
+4. 区域可反复预警 / 解除；查询返回区域当前 `status`、事件 `events` 时间线，以及**每个事件发生时仍在预警的站 ID 列表** `warning_station_ids`（升序）与计数；
+5. 成员站的**补传、审核修订、阈值版本调整**后，待发布区域结果**立即整体重算**（与单站重算语义一致：不成立的历史事件随之消失）；
+6. **发布时与各站时间线一同冻结**：之后的任何变化只影响待发布结果，重新发布才更新公开结果，**历史发布快照保持不变**；责任区在某次发布之后才登记的，该次历史发布不含它；**尚无发布时公开查询明确返回 404 无结果**。
 
 | 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/zones` | 登记责任区，响应含配置与 `pending_zone`（实时重算的待发布区域结果） |
+| GET | `/zones` | 责任区列表（含成员站及登记顺序） |
+| GET | `/zones/{id}` | 责任区配置（登记后不变） |
+| GET | `/zones/{id}/timeline` | 待发布区域联动结果（实时重算） |
+| GET | `/public/zones/{id}/timeline` | 该责任区最近一次发布冻结的联动结果（无发布 → 404） |
+
+待发布区域时间线字段：
+
+```json
+{
+  "published": false,
+  "zone_id": 1,
+  "zone_name": "青石峡片区",
+  "status": "warning",                 // normal | warning（当前区域状态）
+  "active_warning_since": "2026-10-01T00:10:00Z",
+  "trigger_count": 2,                  // K
+  "warning_station_count": 2,          // 当前预警成员站数
+  "warning_station_ids": [1, 2],       // 当前预警成员站 ID（升序）
+  "events": [
+    {
+      "type": "warning",               // warning | cleared
+      "at": "2026-10-01T00:10:00Z",
+      "warning_station_ids": [1, 2],   // 事件发生时预警的站 ID
+      "warning_station_count": 2
+    }
+  ],
+  "members": [
+    {"station_id": 1, "station_name": "甲站", "warning": true,  "warning_before_effective": false},
+    {"station_id": 2, "station_name": "乙站", "warning": true,  "warning_before_effective": false}
+  ]
+}
+```
+
+`POST /publish` 的响应、`GET /publications/{id}` 与 `GET /public/current` 在原有字段之外**新增** `zones` / `zone_timelines`（公开负载中均带 `published: true`）；原有字段与其他接口的请求响应保持不变。
+
+## API 一览
+
+### 监测站与设备| 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/stations` | 登记监测站（上升阈值必须严格大于解除阈值，否则 400） |
 | GET | `/stations` / `/stations/{id}` | 查询监测站 |
@@ -117,14 +172,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/stations/{id}/timeline` | 待发布裁定时间线（实时重算） |
-| POST | `/publish` | 发布：冻结全部监测站当前时间线 |
-| GET | `/publications` / `/publications/{id}` | 查询历史发布版本 |
-| GET | `/public/current` | 最新发布的公开结果 |
+| POST | `/zones` | 登记防汛责任区（未知站 404，重复成员/无时区/K 越界 400） |
+| GET | `/zones` / `/zones/{id}` | 查询责任区列表 / 配置 |
+| GET | `/zones/{id}/timeline` | 待发布跨站联动结果（实时重算） |
+| GET | `/public/zones/{id}/timeline` | 责任区最近一次发布冻结结果（无发布 404） |
+| POST | `/publish` | 发布：冻结全部监测站与责任区当前时间线 |
+| GET | `/publications` / `/publications/{id}` | 查询历史发布版本（含 `zone_timelines`） |
+| GET | `/public/current` | 最新发布的公开结果（含 `zone_timelines`） |
 | GET | `/public/stations/{id}/timeline` | 某站最新公开时间线 |
 
 ## 调用示例
 
-完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → **阈值版本登记/历史/跨版本裁定/校验/冻结**）：
+完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果**）：
 
 ```bash
 ./examples/demo.sh            # 默认打 http://127.0.0.1:8000
@@ -164,14 +223,26 @@ curl -X POST http://127.0.0.1:8000/stations/1/threshold-versions \
   -H 'content-type: application/json' \
   -d '{"effective_at":"2026-10-02T08:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级"}'
 curl http://127.0.0.1:8000/stations/1/threshold-versions
+
+# 登记防汛责任区（非空名称、带时区生效时间、不重复成员站、触发站数 K=2）
+curl -X POST http://127.0.0.1:8000/zones \
+  -H 'content-type: application/json' \
+  -d '{"name":"青石峡片区","effective_at":"2026-10-02T08:00:00+08:00","station_ids":[1,2],"trigger_count":2}'
+
+# 查看待发布跨站联动结果（状态 / 事件时间线 / 事件发生时预警的站 ID）
+curl http://127.0.0.1:8000/zones/1/timeline
+
+# 发布后查询冻结的公开结果（责任区尚无发布时返回 404）
+curl -X POST http://127.0.0.1:8000/publish
+curl http://127.0.0.1:8000/public/zones/1/timeline
 ```
 
 ## 并发与一致性设计
 
-- 所有写操作（补传、作废、更正、阈值版本登记、发布）在 **`BEGIN IMMEDIATE` 事务**中执行，并由进程内锁串行化；SQLite 开启 **WAL + busy_timeout**，并发请求不会丢失已提交记录；
+- 所有写操作（补传、作废、更正、阈值版本登记、责任区登记、发布）在 **`BEGIN IMMEDIATE` 事务**中执行，并由进程内锁串行化；SQLite 开启 **WAL + busy_timeout**，并发请求不会丢失已提交记录；
 - `readings(device_id, seq)` **唯一约束**是幂等的最终防线：并发下同序号写只成功一次，其余按内容比对返回原结果或 409；
 - `threshold_versions(station_id, effective_at)` **唯一约束**保证同站生效时刻不重复（生效时间统一归一化为 UTC 存储，不同时区表示的同一时刻同样冲突）；
-- 发布在单事务内为全部监测站生成快照，公开结果读取的是冻结快照，与后续写入（含阈值调整）互不影响。
+- 责任区配置（`zones` / `zone_members`）只登记、不修改，区域联动结果在读取与发布时按成员站当前待发布时间线实时重算；发布在单事务内为全部监测站与责任区生成快照，公开结果读取的是冻结快照，与后续写入（含补传、审核修订、阈值调整）互不影响。
 
 ## 测试
 
@@ -180,18 +251,20 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、发布冻结、并发补传/发布不丢记录。
+覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、并发补传/发布不丢记录。
 
 ## 项目结构
 
 ```
 app/
-  adjudication.py   # 裁定核心（纯函数：分段、预警、解除）
+  adjudication.py   # 裁定核心（纯函数：单站分段预警/解除 + 责任区跨站联动重放 replay_zone）
   config.py         # 环境变量配置
   db.py             # SQLite 连接、事务与建表
   schemas.py        # 请求模型与校验
   main.py           # FastAPI 路由与应用工厂
-tests/test_api.py   # 端到端测试（46 例）
+tests/
+  conftest.py       # 导入期重定向默认数据库，避免污染工作区
+  test_api.py       # 端到端测试（74 例）
 examples/demo.sh    # 调用示例脚本
 Dockerfile / docker-compose.yml
 ```

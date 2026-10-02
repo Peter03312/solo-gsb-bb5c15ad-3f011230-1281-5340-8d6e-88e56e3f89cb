@@ -79,3 +79,29 @@ class ThresholdVersionCreate(BaseModel):
         if not self.rise_threshold > self.clear_threshold:
             raise ValueError("上升阈值必须严格大于解除阈值")
         return self
+
+
+class ZoneCreate(BaseModel):
+    """登记防汛责任区：非空名称、带时区生效时间、互不重复的成员站 ID、触发站数 K。"""
+
+    name: str = Field(min_length=1, max_length=200, description="责任区名称（非空）")
+    effective_at: datetime = Field(description="带时区的生效时间，如 2026-10-02T08:00:00+08:00")
+    station_ids: list[int] = Field(min_length=1, description="成员监测站 ID 列表（互不重复，至少 1 个）")
+    trigger_count: int = Field(ge=1, description="触发站数 K（1 ≤ K ≤ 成员数）")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("名称不得为空白")
+        return v
+
+    @model_validator(mode="after")
+    def _check_k_and_unique_members(self) -> "ZoneCreate":
+        if len(self.station_ids) != len(set(self.station_ids)):
+            raise ValueError("成员监测站 ID 不得重复")
+        if self.trigger_count > len(self.station_ids):
+            raise ValueError("触发站数 K 不得大于成员站数量")
+        return self

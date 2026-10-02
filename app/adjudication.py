@@ -171,3 +171,96 @@ def adjudicate(
                 result.active_warning_since = e.at
                 break
     return result
+
+
+# ---------------------------------------------------------------- 跨站联动（责任区）
+
+@dataclass(frozen=True)
+class StationStateChange:
+    """一个监测站在某观测时刻的状态变化（取自该站待发布时间线的预警/解除事件）。"""
+
+    station_id: int
+    at: datetime       # 已归一化为带时区时间（UTC）
+    state: str         # 变化后的站状态："warning" | "normal"
+    order: int = 0     # 同时刻多事件时的稳定次序（读数 id）
+
+
+@dataclass(frozen=True)
+class ZoneEvent:
+    """责任区区域预警 / 解除事件。"""
+
+    type: str          # "warning" | "cleared"
+    at: datetime
+    warning_station_ids: tuple  # 事件发生（同刻合并后）仍在预警的成员站 ID（升序）
+    warning_station_count: int
+
+
+@dataclass
+class ZoneReplayResult:
+    status: str        # "normal" | "warning"（截至最后一条变化后的区域状态）
+    events: List[ZoneEvent] = field(default_factory=list)
+    active_warning_since: Optional[datetime] = None
+
+
+def replay_zone(
+    station_changes: List[StationStateChange],
+    initial_warning_station_ids,
+    trigger_count: int,
+    effective_at: datetime,
+) -> ZoneReplayResult:
+    """按观测时间重放成员站状态变化，裁定责任区区域预警 / 解除。
+
+    规则：
+    - initial_warning_station_ids：生效时刻**之前**仍在预警的站，作为初始状态；
+    - 从生效时刻起，按观测时间合并所有站在同一时刻的状态变化后再计数；
+    - 预警站数达到 K → 发出区域预警；降到 K 以下 → 解除；每个时刻最多一个区域事件；
+    - 初始满足 K 时，区域在生效时刻即预警（事件 at = effective_at）。
+    """
+    warning_set = set(initial_warning_station_ids)
+    result = ZoneReplayResult(status="normal")
+
+    # 仅重放生效时刻及之后的变化；同刻合并后统一计数
+    from_effective = sorted(
+        (c for c in station_changes if c.at >= effective_at),
+        key=lambda c: (c.at, c.station_id, c.order),
+    )
+
+    ticks: List[tuple[datetime, List[StationStateChange]]] = []
+    for c in from_effective:
+        if ticks and ticks[-1][0] == c.at:
+            ticks[-1][1].append(c)
+        else:
+            ticks.append((c.at, [c]))
+
+    # 生效时刻的初始判定（此前仍在预警的站计入；初始满足 K 即在生效时刻预警）
+    if not ticks or ticks[0][0] != effective_at:
+        ticks.insert(0, (effective_at, []))
+
+    zone_status = "normal"
+    for at, changes in ticks:
+        for ch in changes:
+            if ch.state == "warning":
+                warning_set.add(ch.station_id)
+            else:
+                warning_set.discard(ch.station_id)
+        count = len(warning_set)
+        if zone_status == "normal" and count >= trigger_count:
+            zone_status = "warning"
+            ids = tuple(sorted(warning_set))
+            result.events.append(
+                ZoneEvent("warning", at, ids, count)
+            )
+        elif zone_status == "warning" and count < trigger_count:
+            zone_status = "normal"
+            ids = tuple(sorted(warning_set))
+            result.events.append(
+                ZoneEvent("cleared", at, ids, count)
+            )
+
+    result.status = zone_status
+    if zone_status == "warning":
+        for e in reversed(result.events):
+            if e.type == "warning":
+                result.active_warning_since = e.at
+                break
+    return result
