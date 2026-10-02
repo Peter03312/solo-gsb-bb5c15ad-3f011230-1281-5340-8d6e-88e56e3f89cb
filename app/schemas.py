@@ -79,3 +79,24 @@ class ThresholdVersionCreate(BaseModel):
         if not self.rise_threshold > self.clear_threshold:
             raise ValueError("上升阈值必须严格大于解除阈值")
         return self
+
+
+class ZoneCreate(BaseModel):
+    """防汛责任区登记：跨站联动预警（登记后配置不变，无修改/删除接口）。"""
+
+    name: str = Field(min_length=1, max_length=200, description="责任区名称（非空）")
+    effective_at: datetime = Field(description="带时区的生效时间，如 2026-10-02T08:00:00+08:00")
+    station_ids: list[int] = Field(min_length=1, description="成员监测站 ID 列表（互不重复、非空）")
+    trigger_count: int = Field(ge=1, description="触发站数 K，1 ≤ K ≤ 成员站数")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @model_validator(mode="after")
+    def _check_members_and_k(self) -> "ZoneCreate":
+        if any(sid <= 0 for sid in self.station_ids):
+            raise ValueError("监测站 ID 必须为正整数")
+        if len(self.station_ids) != len(set(self.station_ids)):
+            raise ValueError("成员监测站 ID 不得重复")
+        if not (1 <= self.trigger_count <= len(self.station_ids)):
+            raise ValueError("触发站数 K 必须满足 1 ≤ K ≤ 成员站数")
+        return self

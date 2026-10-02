@@ -26,7 +26,9 @@ from .schemas import (
     StationCreate,
     ThresholdVersionCreate,
     VoidRequest,
+    ZoneCreate,
 )
+from .zone_adjudication import StationEvent, adjudicate_zone
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -108,8 +110,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.1.0",
-        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本、预警裁定与发布冻结。",
+        version="1.2.0",
+        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本、"
+        "预警裁定、防汛责任区跨站联动预警与发布冻结。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -235,6 +238,124 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             # 每条有效读数实际采用的阈值版本（新增字段，老客户端可忽略）
             "readings": applied,
         }
+
+    def zone_to_dict(conn: sqlite3.Connection, zone: sqlite3.Row) -> dict[str, Any]:
+        members = conn.execute(
+            """
+            SELECT zm.station_id, s.name AS station_name, zm.position
+            FROM zone_members zm JOIN stations s ON s.id = zm.station_id
+            WHERE zm.zone_id=?
+            ORDER BY zm.position, zm.station_id
+            """,
+            (zone["id"],),
+        ).fetchall()
+        return {
+            "id": zone["id"],
+            "name": zone["name"],
+            "effective_at": iso_z(parse_stored(zone["effective_at"])),
+            "trigger_count": zone["trigger_count"],
+            "created_at": zone["created_at"],
+            "members": [
+                {"station_id": m["station_id"], "station_name": m["station_name"]}
+                for m in members
+            ],
+            "station_ids": [m["station_id"] for m in members],
+        }
+
+    def get_zone_or_404(conn: sqlite3.Connection, zone_id: int) -> sqlite3.Row:
+        zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
+        if zone is None:
+            raise HTTPException(status_code=404, detail=f"责任区 {zone_id} 不存在")
+        return zone
+
+    def compute_zone_timeline(conn: sqlite3.Connection, zone_id: int) -> dict[str, Any]:
+        """实时重算责任区待发布结果：重放成员站待发布时间线。"""
+        zone = get_zone_or_404(conn, zone_id)
+        effective_at = parse_stored(zone["effective_at"])
+        trigger_count = zone["trigger_count"]
+        member_rows = conn.execute(
+            """
+            SELECT zm.station_id, s.name AS station_name
+            FROM zone_members zm JOIN stations s ON s.id = zm.station_id
+            WHERE zm.zone_id=?
+            ORDER BY zm.position, zm.station_id
+            """,
+            (zone_id,),
+        ).fetchall()
+        member_ids = [m["station_id"] for m in member_rows]
+        name_by_id = {m["station_id"]: m["station_name"] for m in member_rows}
+
+        station_timelines: dict[int, dict[str, Any]] = {}
+        station_events: list[StationEvent] = []
+        for sid in member_ids:
+            tl = compute_timeline(conn, sid)
+            station_timelines[sid] = tl
+            for e in tl["events"]:
+                station_events.append(StationEvent(station_id=sid, type=e["type"], at=parse_stored(e["at"])))
+
+        res = adjudicate_zone(member_ids, station_events, effective_at, trigger_count)
+
+        def ids_with_names(ids: list[int]) -> list[dict[str, Any]]:
+            return [{"station_id": sid, "station_name": name_by_id[sid]} for sid in ids]
+
+        warning_now = sorted(
+            sid for sid in member_ids if res.member_status.get(sid) == "warning"
+        )
+        return {
+            "zone_id": zone_id,
+            "zone_name": zone["name"],
+            "effective_at": iso_z(effective_at),
+            "trigger_count": trigger_count,
+            "member_station_ids": member_ids,
+            "members": ids_with_names(member_ids),
+            "status": res.status,
+            "warning_station_count": len(warning_now),
+            "warning_station_ids": warning_now,
+            "warning_stations": ids_with_names(warning_now),
+            "active_warning_since": iso_z(res.active_warning_since) if res.active_warning_since else None,
+            "initial_warning_station_ids": res.initial_warning_station_ids,
+            "initial_warning_stations": ids_with_names(res.initial_warning_station_ids),
+            "station_events_considered": res.station_events_considered,
+            "events": [
+                {
+                    "type": e.type,
+                    "at": iso_z(e.at),
+                    "warning_station_ids": list(e.warning_station_ids),
+                    "warning_stations": ids_with_names(e.warning_station_ids),
+                }
+                for e in res.events
+            ],
+            "member_status": [
+                {
+                    "station_id": sid,
+                    "station_name": name_by_id[sid],
+                    "status": res.member_status.get(sid, "normal"),
+                }
+                for sid in member_ids
+            ],
+            # 附带成员站各自的待发布时间线，便于核对
+            "station_timelines": [station_timelines[sid] for sid in member_ids],
+        }
+
+    def affected_zone_summaries(conn: sqlite3.Connection, station_id: int) -> list[dict[str, Any]]:
+        """补传/审核/阈值调整后，返回受影响责任区的重算摘要。"""
+        zone_rows = conn.execute(
+            "SELECT zone_id FROM zone_members WHERE station_id=? ORDER BY zone_id",
+            (station_id,),
+        ).fetchall()
+        summaries = []
+        for rz in zone_rows:
+            ztl = compute_zone_timeline(conn, rz["zone_id"])
+            summaries.append(
+                {
+                    "zone_id": ztl["zone_id"],
+                    "zone_name": ztl["zone_name"],
+                    "status": ztl["status"],
+                    "warning_station_ids": ztl["warning_station_ids"],
+                    "event_count": len(ztl["events"]),
+                }
+            )
+        return summaries
 
     def get_station_or_404(conn: sqlite3.Connection, station_id: int) -> sqlite3.Row:
         st = conn.execute("SELECT * FROM stations WHERE id=?", (station_id,)).fetchone()
@@ -363,6 +484,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             dev = conn.execute("SELECT * FROM devices WHERE device_no=?", (body.device_no,)).fetchone()
             if dev is None:
                 raise HTTPException(status_code=404, detail=f"未知设备号 {body.device_no}")
+            station_id = dev["station_id"]
 
             existing = conn.execute(
                 "SELECT * FROM readings WHERE device_id=? AND seq=?", (dev["id"], body.seq)
@@ -373,9 +495,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     and existing["water_level"] == body.water_level
                 )
                 if same:
-                    # 同号同序号同内容：返回原结果
+                    # 同号同序号同内容：返回原结果（幂等重试不改变任何待发布结果）
                     response.status_code = status.HTTP_200_OK
-                    return {**reading_to_dict(existing, dev["device_no"]), "deduplicated": True}
+                    return {
+                        **reading_to_dict(existing, dev["device_no"]),
+                        "deduplicated": True,
+                        "affected_zones": affected_zone_summaries(conn, station_id),
+                    }
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -405,12 +531,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 if existing is not None and parse_stored(existing["observed_at"]) == obs_utc \
                         and existing["water_level"] == body.water_level:
                     response.status_code = status.HTTP_200_OK
-                    return {**reading_to_dict(existing, dev["device_no"]), "deduplicated": True}
+                    return {
+                        **reading_to_dict(existing, dev["device_no"]),
+                        "deduplicated": True,
+                        "affected_zones": affected_zone_summaries(conn, station_id),
+                    }
                 raise HTTPException(status_code=409, detail=f"设备 {body.device_no} 序号 {body.seq} 冲突")
             row = conn.execute("SELECT * FROM readings WHERE id=?", (cur.lastrowid,)).fetchone()
+            # 补传后重算待发布区域结果
+            affected_zones = affected_zone_summaries(conn, station_id)
 
         response.status_code = status.HTTP_201_CREATED
-        return {**reading_to_dict(row, dev["device_no"]), "deduplicated": False}
+        return {
+            **reading_to_dict(row, dev["device_no"]),
+            "deduplicated": False,
+            "affected_zones": affected_zones,
+        }
 
     @app.get("/stations/{station_id}/readings", tags=["读数"])
     def list_station_readings(station_id: int, include_voided: bool = False) -> list[dict[str, Any]]:
@@ -468,6 +604,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {
             "reading": reading_to_dict(updated, device_no),
             "pending_adjudication": {"station_id": station_id, "status": timeline["status"], "events": timeline["events"]},
+            "affected_zones": affected_zone_summaries(conn, station_id),
         }
 
     @app.post("/readings/{reading_id}/correct", tags=["审核"])
@@ -512,6 +649,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {
             "reading": reading_to_dict(updated, device_no),
             "pending_adjudication": {"station_id": station_id, "status": timeline["status"], "events": timeline["events"]},
+            "affected_zones": affected_zone_summaries(conn, station_id),
         }
 
     @app.get("/readings/{reading_id}/revisions", tags=["审核"])
@@ -587,6 +725,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "status": timeline["status"],
                 "events": timeline["events"],
             },
+            "affected_zones": affected_zone_summaries(conn, station_id),
         }
 
     @app.get("/stations/{station_id}/threshold-versions", tags=["阈值版本"])
@@ -606,6 +745,76 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             },
             "versions": [threshold_version_to_dict(r) for r in rows],
         }
+
+    # ------------------------------------------------------------ 责任区（跨站联动预警）
+
+    @app.post("/zones", status_code=201, tags=["责任区"])
+    def create_zone(body: ZoneCreate) -> dict[str, Any]:
+        """登记防汛责任区（跨站联动预警）。登记后配置不变，无修改/删除接口。
+
+        校验（体校验失败统一 400）：
+        - name 非空；effective_at 必带时区；
+        - station_ids 非空、元素互不重复；
+        - trigger_count K 满足 1 ≤ K ≤ 成员数；
+        成员中存在未知监测站 → 404。
+        """
+        eff_utc = body.effective_at.astimezone(timezone.utc)
+        eff_str = eff_utc.isoformat()
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            placeholders = ",".join("?" for _ in body.station_ids)
+            found = conn.execute(
+                f"SELECT id FROM stations WHERE id IN ({placeholders})", body.station_ids
+            ).fetchall()
+            if len(found) != len(set(body.station_ids)):
+                known = {r["id"] for r in found}
+                unknown = sorted(set(body.station_ids) - known)
+                raise HTTPException(status_code=404, detail=f"未知监测站 ID: {unknown}")
+            cur = conn.execute(
+                "INSERT INTO zones(name, effective_at, trigger_count, created_at) VALUES (?,?,?,?)",
+                (body.name, eff_str, body.trigger_count, now),
+            )
+            zone_id = cur.lastrowid
+            for pos, sid in enumerate(body.station_ids):
+                conn.execute(
+                    "INSERT INTO zone_members(zone_id, station_id, position) VALUES (?,?,?)",
+                    (zone_id, sid, pos),
+                )
+            zone = conn.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()
+            detail = zone_to_dict(conn, zone)
+            timeline = compute_zone_timeline(conn, zone_id)
+        return {"zone": detail, "timeline": timeline}
+
+    @app.get("/zones", tags=["责任区"])
+    def list_zones() -> list[dict[str, Any]]:
+        with db.read() as conn:
+            zones = conn.execute("SELECT * FROM zones ORDER BY id").fetchall()
+            result = []
+            for z in zones:
+                d = zone_to_dict(conn, z)
+                tl = compute_zone_timeline(conn, z["id"])
+                d.update(
+                    {
+                        "status": tl["status"],
+                        "warning_station_ids": tl["warning_station_ids"],
+                        "warning_station_count": tl["warning_station_count"],
+                        "event_count": len(tl["events"]),
+                    }
+                )
+                result.append(d)
+        return result
+
+    @app.get("/zones/{zone_id}", tags=["责任区"])
+    def get_zone(zone_id: int) -> dict[str, Any]:
+        with db.read() as conn:
+            detail = zone_to_dict(conn, get_zone_or_404(conn, zone_id))
+        return detail
+
+    @app.get("/zones/{zone_id}/timeline", tags=["责任区"])
+    def pending_zone_timeline(zone_id: int) -> dict[str, Any]:
+        with db.read() as conn:
+            timeline = compute_zone_timeline(conn, zone_id)
+        return {"published": False, **timeline}
 
     # ------------------------------------------------------------ 裁定时间线（待发布）
 
@@ -642,7 +851,31 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         "event_count": len(timeline["events"]),
                     }
                 )
-        return {"publication_id": pub_id, "published_at": now, "note": note, "stations": summaries}
+            # 责任区时间线与各站时间线在同一发布事务内一并冻结
+            zones = conn.execute("SELECT id FROM zones ORDER BY id").fetchall()
+            zone_summaries = []
+            for z in zones:
+                ztl = compute_zone_timeline(conn, z["id"])
+                conn.execute(
+                    "INSERT INTO publication_zones(publication_id, zone_id, timeline_json) VALUES (?,?,?)",
+                    (pub_id, z["id"], json.dumps(ztl, ensure_ascii=False)),
+                )
+                zone_summaries.append(
+                    {
+                        "zone_id": z["id"],
+                        "zone_name": ztl["zone_name"],
+                        "status": ztl["status"],
+                        "warning_station_ids": ztl["warning_station_ids"],
+                        "event_count": len(ztl["events"]),
+                    }
+                )
+        return {
+            "publication_id": pub_id,
+            "published_at": now,
+            "note": note,
+            "stations": summaries,
+            "zones": zone_summaries,
+        }
 
     @app.get("/publications", tags=["发布"])
     def list_publications() -> list[dict[str, Any]]:
@@ -660,12 +893,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "SELECT station_id, timeline_json FROM publication_timelines WHERE publication_id=? ORDER BY station_id",
                 (publication_id,),
             ).fetchall()
+            zrows = conn.execute(
+                "SELECT zone_id, timeline_json FROM publication_zones WHERE publication_id=? ORDER BY zone_id",
+                (publication_id,),
+            ).fetchall()
         return {
             "publication_id": pub["id"],
             "published_at": pub["published_at"],
             "note": pub["note"],
             "timelines": [
                 {"published": True, **json.loads(r["timeline_json"])} for r in rows
+            ],
+            "zones": [
+                {"published": True, **json.loads(r["timeline_json"])} for r in zrows
             ],
         }
 
@@ -679,11 +919,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "SELECT station_id, timeline_json FROM publication_timelines WHERE publication_id=? ORDER BY station_id",
                 (pub["id"],),
             ).fetchall()
+            zrows = conn.execute(
+                "SELECT zone_id, timeline_json FROM publication_zones WHERE publication_id=? ORDER BY zone_id",
+                (pub["id"],),
+            ).fetchall()
         return {
             "publication_id": pub["id"],
             "published_at": pub["published_at"],
             "note": pub["note"],
             "timelines": [{"published": True, **json.loads(r["timeline_json"])} for r in rows],
+            "zones": [{"published": True, **json.loads(r["timeline_json"])} for r in zrows],
         }
 
     @app.get("/public/stations/{station_id}/timeline", tags=["公开结果"])
@@ -702,6 +947,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             ).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="该监测站尚无已发布结果")
+        return {
+            "publication_id": row["pub_id"],
+            "published_at": row["published_at"],
+            "published": True,
+            **json.loads(row["timeline_json"]),
+        }
+
+    @app.get("/public/zones/{zone_id}/timeline", tags=["公开结果"])
+    def public_zone_timeline(zone_id: int) -> dict[str, Any]:
+        with db.read() as conn:
+            get_zone_or_404(conn, zone_id)
+            row = conn.execute(
+                """
+                SELECT pz.timeline_json, p.id AS pub_id, p.published_at
+                FROM publication_zones pz
+                JOIN publications p ON p.id = pz.publication_id
+                WHERE pz.zone_id=?
+                ORDER BY pz.publication_id DESC LIMIT 1
+                """,
+                (zone_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="该责任区尚无已发布结果")
         return {
             "publication_id": row["pub_id"],
             "published_at": row["published_at"],
